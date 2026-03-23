@@ -1,0 +1,2 @@
+// Paste this in your browser console at resy.com (while logged in)
+fetch("https://api.resy.com/3/auth/refresh",{method:"POST",credentials:"include",headers:{Authorization:'ResyAPI api_key="VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"'}}).then(r=>r.json()).then(d=>{navigator.clipboard.writeText(d.token);console.log("Auth token copied to clipboard!")}).catch(()=>console.log("Not logged in — log in to resy.com first"))

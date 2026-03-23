@@ -1,0 +1,45 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+*.o
+*.a
+
+# Go
+vendor/
+
+# C++
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.d
+
+# Build
+build/
+bin/
+table42
+table42-linux
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Environment
+.env
+
+# Project-specific
+captures/
+docs/
+CLAUDE.md
