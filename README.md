@@ -9,8 +9,10 @@ Book restaurant reservations the instant they drop on Resy. A single Go binary t
 **1. Get your auth token** — go to [resy.com](https://resy.com), log in, open DevTools (`F12`) → Console, paste this:
 
 ```js
-fetch("https://api.resy.com/3/auth/refresh",{method:"POST",credentials:"include",headers:{Authorization:'ResyAPI api_key="VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"'}}).then(r=>r.json()).then(d=>{navigator.clipboard.writeText(d.token);console.log("Auth token copied to clipboard!")}).catch(()=>console.log("Not logged in — log in to resy.com first"))
+copy(apiAuthToken);console.log(apiAuthToken)
 ```
+
+That copies your auth token to the clipboard. (Resy stores it as `window.apiAuthToken`.)
 
 **2. Build**
 
