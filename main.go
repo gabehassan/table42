@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +18,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 )
 
 // Semi-static API key — same for all Resy web users.
@@ -29,9 +31,11 @@ const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/5
 
 // Package-level vars set once at startup — zero alloc in hot path.
 var (
-	pinnedIP   string
 	authHeader string // raw auth token value (not the "ResyAPI api_key" header)
 	venueName  string // fetched once at startup for webhooks/logs
+	logWriter  io.Writer = os.Stderr // tee'd to per-run log file after initRunLog()
+	runLogFile *os.File              // closed at exit
+	respLog    *os.File              // response body log — captures raw API responses
 )
 
 // ───────────────────────────── Timing Log ─────────────────────────────
@@ -107,17 +111,38 @@ func (tl *TimingLog) dump() {
 	}
 	defer f.Close()
 
+	// Determine outcome from entries for quick filtering
+	outcome := "unknown"
+	for _, e := range tl.entries {
+		switch e.Step {
+		case "BOOKED":
+			outcome = "booked"
+		case "no-slots-found", "no-slots-t0", "retry-exhausted":
+			if outcome != "booked" {
+				outcome = "no-slots"
+			}
+		case "book-failed":
+			if outcome != "booked" {
+				outcome = "book-failed"
+			}
+		}
+	}
+
 	// Include config context so every log entry is self-contained for debugging
 	entry := map[string]any{
 		"timestamp":  tl.start.Format(time.RFC3339Nano),
+		"outcome":    outcome,
 		"venue_id":   os.Getenv("RESY_VENUE_ID"),
+		"venue_name": venueName,
 		"date":       os.Getenv("RESY_DATE"),
 		"time":       os.Getenv("RESY_TIME"),
+		"time_range": os.Getenv("RESY_TIME_RANGE"),
 		"party_size": os.Getenv("RESY_PARTY_SIZE"),
 		"table_type": os.Getenv("RESY_TABLE_TYPE"),
 		"drop_time":  os.Getenv("RESY_DROP_TIME"),
 		"shots":      os.Getenv("RESY_SHOTS"),
-		"pinned_ip":  pinnedIP,
+		"max_book":   os.Getenv("RESY_MAX_BOOK"),
+		"pinned_ip":  "",
 		"entries":    tl.entries,
 		"total_ms":   total.Milliseconds(),
 	}
@@ -156,9 +181,11 @@ type Config struct {
 	MonInterval int    // monitor poll interval in seconds
 	ProxyFile   string
 	OutputJSON  bool
-	WebhookURL    string // RESY_WEBHOOK — Discord/Slack webhook URL
+	WebhookURL    string // RESY_WEBHOOK — Discord webhook URL
 	CapSolverKey string // RESY_CAPSOLVER_KEY — CAPSolver API key (AI-based, 5-15s)
 	CaptchaToken string // pre-solved captcha token (set at runtime)
+	BlindFire    bool          // --blind-fire: fire parallel shots at exact T-0
+	MonitorUntil time.Duration // --monitor-until: how long to monitor (0 = indefinite)
 }
 
 type Slot struct {
@@ -199,10 +226,9 @@ func main() {
 			if webhookURL == "" {
 				fatal("RESY_WEBHOOK not set.")
 			}
+			// DNS lookup for webhook display only
 			ips, _ := net.LookupHost("api.resy.com")
-			if len(ips) > 0 {
-				pinnedIP = ips[0]
-			}
+			_ = ips
 			if vid := intEnv("RESY_VENUE_ID", 0); vid > 0 {
 				if name := fetchVenueName(vid); name != "" {
 					venueName = name
@@ -223,12 +249,88 @@ func main() {
 			time.Sleep(1 * time.Second) // wait for goroutines
 			logf("Test webhooks sent (config, success, failure).")
 			return
+		case "test-proxy":
+			// Test all proxies in proxylist.txt against Resy API
+			loadDotEnv()
+			proxies := loadProxyList("")
+			if len(proxies) == 0 {
+				fmt.Println("No proxies found. Create proxylist.txt with one proxy per line:")
+				fmt.Println("  http://user:pass@host:port")
+				fmt.Println("  host:port:user:pass  (auto-converted)")
+				return
+			}
+			fmt.Printf("Testing %d proxies against api.resy.com...\n\n", len(proxies))
+			for i, proxy := range proxies {
+				opts := []tls_client.HttpClientOption{
+					tls_client.WithClientProfile(profiles.Chrome_146),
+					tls_client.WithTimeoutSeconds(10),
+					tls_client.WithProxyUrl(proxy),
+					tls_client.WithInsecureSkipVerify(),
+				}
+				tc, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
+				if err != nil {
+					fmt.Printf("  [%d] FAIL — client error: %v\n", i+1, err)
+					continue
+				}
+				req, _ := fhttp.NewRequest("GET", "https://api.resy.com/3/geoip", nil)
+				req.Header.Set("Authorization", resyAPIKey)
+				req.Header.Set("Accept", "application/json")
+				start := time.Now()
+				resp, err := tc.Do(req)
+				elapsed := time.Since(start)
+				if err != nil {
+					fmt.Printf("  [%d] FAIL — %v (%v)\n", i+1, err, elapsed.Round(time.Millisecond))
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				// Extract IP from geoip response
+				ip := "?"
+				if idx := strings.Index(string(body), `"ip":`); idx >= 0 {
+					s := string(body[idx+5:])
+					if q := strings.IndexByte(s, '"'); q >= 0 {
+						s = s[q+1:]
+						if q2 := strings.IndexByte(s, '"'); q2 >= 0 {
+							ip = s[:q2]
+						}
+					}
+				}
+				fmt.Printf("  [%d] OK — HTTP %d, IP: %s, %v\n", i+1, resp.StatusCode, ip, elapsed.Round(time.Millisecond))
+			}
+			return
 		}
 	}
 
 	cfg := loadConfig()
+	initRunLog()
 	tlog = newTimingLog()
-	defer tlog.dump() // always write timing log, even on fatal
+	defer func() {
+		tlog.dump()
+		if runLogFile != nil {
+			runLogFile.Close()
+		}
+		if respLog != nil {
+			respLog.Close()
+		}
+	}()
+
+	// Log full config for post-mortem debugging
+	logf("Config: venue=%d date=%s time=%s range=%s party=%d table=%q shots=%d maxbook=%d",
+		cfg.VenueID, cfg.Date, cfg.Time, cfg.TimeRange, cfg.PartySize, cfg.TableType, cfg.Shots, cfg.MaxBook)
+	if !cfg.DropTime.IsZero() {
+		logf("Config: drop_time=%s (in %v) blind_fire=%v", cfg.DropTime.Format(time.RFC3339), time.Until(cfg.DropTime).Round(time.Second), cfg.BlindFire)
+		if cfg.MonitorUntil > 0 {
+			logf("Config: monitor_until=%v (deadline %s)", cfg.MonitorUntil, cfg.DropTime.Add(cfg.MonitorUntil).Format("15:04:05"))
+		} else {
+			logf("Config: monitor_until=indefinite")
+		}
+	}
+	if cfg.Monitor {
+		logf("Config: monitor=true interval=%ds", cfg.MonInterval)
+	}
+	if cfg.CapSolverKey != "" {
+		logf("Config: capsolver=enabled")
+	}
 
 	// ─── Phase 0: Auth ───
 	if cfg.AuthToken == "" {
@@ -248,6 +350,13 @@ func main() {
 	authHeader = cfg.AuthToken
 	initBaseHeaders() // pre-build HTTP headers once — avoids 11 Set() calls per request
 
+	// Validate token before committing to a potentially 18+ hour sleep.
+	// A revoked token returns 419 from Resy — detect it now, not at drop time.
+	if err := validateAuthToken(cfg.AuthToken); err != nil {
+		fatal("Auth token invalid: %v\nGet a fresh token from resy.com and update RESY_AUTH_TOKEN.", err)
+	}
+	logf("Auth token validated.")
+
 	// Try to get payment ID if still missing — payment_id=0 works for
 	// venues with allow_bypass_payment_method=1 (e.g., 4 Charles, L'Artusi)
 	if cfg.PaymentID == 0 {
@@ -265,9 +374,60 @@ func main() {
 	findURL := buildFindURL(cfg.VenueID, cfg.Date, cfg.PartySize)
 	findBody := buildFindBody(cfg.VenueID, cfg.Date, cfg.PartySize)
 
-	// Fetch venue name (one API call, before critical window — not in hot path)
+	// ─── Phase 2: Build multi-client proxy architecture ───
+	// Benchmark all proxies, assign roles by speed, build one client per proxy.
+	proxies := loadProxyList(cfg.ProxyFile)
+	var monitorClients []*http.Client // for polling (one per date)
+	var bookingClients []*http.Client // for booking pipeline (parallel)
+	var reserveClients []*http.Client // failover pool
+
+	if len(proxies) > 0 {
+		benchResults := benchmarkProxies(proxies)
+		if len(benchResults) >= 6 {
+			// Fastest 3 → booking, next 3 → monitoring, rest → reserve
+			for i, r := range benchResults {
+				c := buildStickyClient(r.ProxyURL)
+				if i < 3 {
+					bookingClients = append(bookingClients, c)
+					logf("  Booking[%d]: %s (%v)", i, truncateProxy(r.ProxyURL), r.WarmRTT.Round(time.Millisecond))
+				} else if i < 6 {
+					monitorClients = append(monitorClients, c)
+					logf("  Monitor[%d]: %s (%v)", i-3, truncateProxy(r.ProxyURL), r.WarmRTT.Round(time.Millisecond))
+				} else {
+					reserveClients = append(reserveClients, c)
+				}
+			}
+		} else if len(benchResults) > 0 {
+			// Fewer than 6 — split evenly: first half booking, second half monitoring
+			mid := len(benchResults) / 2
+			if mid == 0 {
+				mid = 1
+			}
+			for i, r := range benchResults {
+				c := buildStickyClient(r.ProxyURL)
+				if i < mid {
+					bookingClients = append(bookingClients, c)
+				} else {
+					monitorClients = append(monitorClients, c)
+				}
+			}
+		}
+	}
+
+	// Fallback: no proxies or all failed — single direct client
+	if len(bookingClients) == 0 {
+		logf("No usable proxies — running direct (no proxy)")
+		direct := buildStickyClient("")
+		bookingClients = append(bookingClients, direct)
+		monitorClients = append(monitorClients, direct)
+	}
+
+	// Use first monitoring client for startup tasks (venue name fetch, etc.)
+	startupClient := monitorClients[0]
+
+	// Fetch venue name through Chrome-fingerprinted proxy client
 	venueName = fmt.Sprintf("venue-%d", cfg.VenueID)
-	if name := fetchVenueName(cfg.VenueID); name != "" {
+	if name := fetchVenueName(cfg.VenueID, startupClient); name != "" {
 		venueName = name
 	}
 	logf("Target: %s (%d) on %s at %s, party of %d", venueName, cfg.VenueID, cfg.Date, cfg.Time, cfg.PartySize)
@@ -275,10 +435,11 @@ func main() {
 		logf("Preferred table type: %s", cfg.TableType)
 	}
 
-	// ─── Phase 2: Build client with DNS pinning ───
-	client := buildClient()
+	// Primary client for general use (monitoring client[0])
+	client := monitorClients[0]
+	_ = reserveClients // available for failover
 
-	// Send startup webhook (after DNS pinning so IP shows in webhook)
+	// Send startup webhook
 	sendTestWebhook(cfg.WebhookURL)
 
 	// ─── Phase 3: Mode selection ───
@@ -301,101 +462,203 @@ func main() {
 		skipFind = true
 
 	} else if !cfg.DropTime.IsZero() {
-		// Drop-time mode: captcha → sleep → warm → pre-poll → spin-wait → fire
+		// Drop-time mode: sleep until drop time, then monitor for slots and book.
 		//
 		// Timeline:
-		//   T-90s  Pre-solve captcha (if RESY_CAPSOLVER_KEY set)
-		//   T-30s  Warm connections
-		//   T-10s  Pre-poll for early drops
-		//   T-0s   Spin-wait fires with 33ns precision
+		//   T-30s  Wake up, warm connections, pre-solve captcha
+		//   T-30s  Start monitoring (poll every 2s)
+		//   T-0s   If --blind-fire: also fire parallel shots at exact drop time
+		//   T+??   Monitor until slots found, deadline, or indefinitely
+		//
+		// Flags:
+		//   --blind-fire       Fire parallel shots at T-0 (aggressive, risk of rate limit)
+		//   --monitor-until 5m Stop monitoring 5m after drop time (default: indefinite)
 
-		// Pre-solve captcha at T-60s (tokens valid ~120s, solving takes 10-30s)
-		// Only runs in drop-time mode — no point pre-solving for immediate bookings
-		// since most venues don't require captcha.
-		captchaLead := intEnv("RESY_CAPTCHA_LEAD", 60) // seconds before drop to solve
-		if cfg.CapSolverKey != "" {
-			captchaDur := time.Until(cfg.DropTime) - time.Duration(captchaLead)*time.Second
-			if captchaDur > 0 {
-				logf("Sleeping until T-%ds for captcha pre-solve...", captchaLead)
-				time.Sleep(captchaDur)
-			}
-			preSolveCaptcha(&cfg)
-		}
-
+		// Sleep until T-30s
 		sleepDur := time.Until(cfg.DropTime) - 30*time.Second
 		if sleepDur > 0 {
-			logf("Sleeping until T-30s (%s)...", cfg.DropTime.Add(-30*time.Second).Format("15:04:05"))
+			logf("Sleeping until T-30s (%s)...", cfg.DropTime.Add(-30*time.Second).Format("2006-01-02 15:04:05"))
 			time.Sleep(sleepDur)
 		}
 
-		warmConnections(client, cfg.Shots, findURL, findBody)
+		// Skip re-validation after sleep. The token was validated at startup
+		// and JWT expiry is ~45 days. Re-validating at T-30s uses a bare
+		// http.Client (no proxy, no Chrome fingerprint) which hits Imperva
+		// directly from the AWS IP and can timeout — killing the entire run
+		// 20 seconds before the drop. Not worth the risk.
 
-		// Pre-build book payload AFTER captcha solve (includes token if available)
+		// Pre-solve captcha (if blind-fire, solve now; otherwise solve just-in-time)
+		if cfg.CapSolverKey != "" && cfg.BlindFire {
+			preSolveCaptcha(&cfg)
+		}
+
+		// Warm ALL clients in parallel — monitoring + booking
+		logf("Warming %d monitoring + %d booking clients...", len(monitorClients), len(bookingClients))
+		var warmWg sync.WaitGroup
+		allClients := append(monitorClients, bookingClients...)
+		for _, wc := range allClients {
+			warmWg.Add(1)
+			go func(c *http.Client) {
+				defer warmWg.Done()
+				warmConnections(c, 1, findURL, findBody)
+			}(wc)
+		}
+		warmWg.Wait()
+		logf("All %d clients warmed.", len(allClients))
+
 		initBookPayload(cfg.PaymentID, cfg.CaptchaToken)
-
 		runtime.GC()
 		debug.SetGCPercent(-1)
 
-		// Pre-poll phase: rapid-fire find requests from T-10s to T
-		// If slots appear early, skip the spin-wait and book immediately
-		prePollStart := cfg.DropTime.Add(-10 * time.Second)
-		if time.Now().Before(prePollStart) {
-			logf("Waiting until T-10s for pre-poll (%s)...", prePollStart.Format("15:04:05"))
-			time.Sleep(time.Until(prePollStart))
+		// Compute monitoring deadline
+		var monitorDeadline time.Time
+		if cfg.MonitorUntil > 0 {
+			monitorDeadline = cfg.DropTime.Add(cfg.MonitorUntil)
+			logf("Monitoring until %s (%v after drop)...", monitorDeadline.Format("15:04:05"), cfg.MonitorUntil)
+		} else {
+			logf("Monitoring indefinitely until slots found...")
 		}
 
-		logf("Pre-polling from T-10s to T (%s → %s)...", time.Now().Format("15:04:05.000"), cfg.DropTime.Format("15:04:05.000"))
-		tlog.record("pre-poll-start", 0, 0, "")
+		// ─── Monitor loop ───
+		// Poll target date ± 1 day IN PARALLEL on each cycle.
+		// All dates fire simultaneously — total cycle time equals the
+		// slowest single request (~700ms through proxy), not the sum.
+		// This eliminates the speed penalty of checking multiple dates.
 
-		pollInterval := 150 * time.Millisecond
-		for time.Now().Before(cfg.DropTime) {
-			data, status, err := doRequest(context.Background(), client, "POST", "https://api.resy.com/4/find", findBody, "application/json")
-			if err == nil && status == 200 {
-				earlySlots := parseSlots(data, "")
-				if len(earlySlots) > 0 {
-					logf("EARLY DROP! Found %d slots at T-%v", len(earlySlots), time.Until(cfg.DropTime).Round(time.Millisecond))
-					tlog.record("early-drop", 0, len(earlySlots), fmt.Sprintf("T-%v", time.Until(cfg.DropTime).Round(time.Millisecond)))
-					slots = earlySlots
+		targetDate, _ := time.Parse("2006-01-02", cfg.Date)
+		monitorDates := []string{
+			targetDate.AddDate(0, 0, -1).Format("2006-01-02"),
+			cfg.Date,
+			targetDate.AddDate(0, 0, 1).Format("2006-01-02"),
+		}
+		logf("Monitoring %d dates in parallel: %v", len(monitorDates), monitorDates)
+
+		type pollResult struct {
+			date   string
+			data   []byte
+			status int
+			err    error
+		}
+
+		tlog.record("monitor-start", 0, 0, fmt.Sprintf("dates=%v", monitorDates))
+		pollInterval := 2 * time.Second
+		monCount := 0
+		blindFired := false
+		consecutive500 := 0
+
+		// getPollInterval returns the optimal poll interval based on time since drop.
+		// Aggressive burst at T+0..T+10s (500ms), taper to 1s, then back to 2s.
+		getPollInterval := func() time.Duration {
+			if cfg.DropTime.IsZero() {
+				return 2 * time.Second
+			}
+			elapsed := time.Since(cfg.DropTime)
+			if elapsed < 0 {
+				return 2 * time.Second // pre-drop
+			}
+			if elapsed < 10*time.Second {
+				return 500 * time.Millisecond // critical window
+			}
+			if elapsed < 60*time.Second {
+				return 1 * time.Second // taper
+			}
+			return 2 * time.Second
+		}
+
+		for {
+			// Check deadline
+			if !monitorDeadline.IsZero() && time.Now().After(monitorDeadline) {
+				logf("Monitor deadline reached after %d cycles.", monCount)
+				tlog.record("monitor-deadline", 0, monCount, fmt.Sprintf("%d cycles", monCount))
+				break
+			}
+
+			// Blind fire at T-0 (once, if enabled)
+			if cfg.BlindFire && !blindFired && !time.Now().Before(cfg.DropTime) {
+				blindFired = true
+				spinUntil(cfg.DropTime)
+				drift := time.Since(cfg.DropTime)
+				logf("BLIND FIRE! (drift: %v)", drift)
+				tlog.record("blind-fire", 0, 0, fmt.Sprintf("drift=%v", drift))
+				bfSlots := fireAvailabilityShots(client, cfg.Shots, findURL, findBody, "")
+				if len(bfSlots) > 0 {
+					logf("Blind fire found %d slots!", len(bfSlots))
+					slots = bfSlots
 					skipFind = true
 					break
 				}
-			} else if status == 500 {
-				// Back off on 500 to avoid deepening a rate limit
-				pollInterval = 500 * time.Millisecond
+				logf("Blind fire: no slots. Continuing to monitor...")
 			}
+
+			// Fire all dates in parallel
+			monCount++
+			resultCh := make(chan pollResult, len(monitorDates))
+			for _, d := range monitorDates {
+				go func(date string) {
+					body := buildFindBody(cfg.VenueID, date, cfg.PartySize)
+					data, status, err := doRequest(context.Background(), client, "POST", "https://api.resy.com/4/find", body, "application/json")
+					if err == nil && status == 500 {
+						u := buildFindURL(cfg.VenueID, date, cfg.PartySize)
+						data, status, err = doRequest(context.Background(), client, "GET", u, nil, "")
+					}
+					resultCh <- pollResult{date: date, data: data, status: status, err: err}
+				}(d)
+			}
+
+			// Collect all results
+			foundSlots := false
+			for i := 0; i < len(monitorDates); i++ {
+				r := <-resultCh
+
+				if r.err == nil {
+					logResponse(fmt.Sprintf("monitor-%d-%s", monCount, r.date), r.status, r.data)
+				}
+
+				if r.err != nil {
+					logf("Monitor #%d [%s]: error: %v", monCount, r.date, r.err)
+				} else if r.status == 419 || r.status == 401 {
+					fatal("Monitor #%d: auth rejected (HTTP %d).", monCount, r.status)
+				} else if r.status == 500 || r.status == 429 || r.status == 403 {
+					consecutive500++
+					logf("Monitor #%d [%s]: HTTP %d (consecutive: %d)", monCount, r.date, r.status, consecutive500)
+					// Back off on errors, but cap at 1s during the critical burst window
+					base := getPollInterval()
+					maxBackoff := max(base, 1*time.Second)
+					pollInterval = min(pollInterval+500*time.Millisecond, maxBackoff)
+				} else if r.status == 200 {
+					if consecutive500 > 0 {
+						logf("Monitor #%d [%s]: API recovered after %d consecutive errors", monCount, r.date, consecutive500)
+					}
+					consecutive500 = 0
+					pollInterval = getPollInterval()
+					monSlots := parseSlots(r.data, "")
+					if len(monSlots) > 0 && !foundSlots {
+						foundSlots = true
+						logf("SLOTS FOUND on %s! %d slots at cycle #%d (T%+v)",
+							r.date, len(monSlots), monCount, time.Since(cfg.DropTime).Round(time.Millisecond))
+						tlog.record("slots-detected", 0, len(monSlots),
+							fmt.Sprintf("date=%s cycle=%d T%+v", r.date, monCount, time.Since(cfg.DropTime).Round(time.Millisecond)))
+						cfg.Date = r.date
+						slots = monSlots
+						skipFind = true
+					}
+				} else {
+					logf("Monitor #%d [%s]: HTTP %d", monCount, r.date, r.status)
+				}
+			}
+
+			if foundSlots {
+				break
+			}
+
 			time.Sleep(pollInterval)
+			// Recalculate base interval for next cycle (accelerates at T+0)
+			pollInterval = getPollInterval()
 		}
 
-		if !skipFind {
-			// No early drop — spin-wait to exact drop time with nanosecond precision
-			spinUntil(cfg.DropTime)
-			drift := time.Since(cfg.DropTime)
-			logf("FIRING! (drift: %v)", drift)
-			tlog.record("spin-wait-done", 0, 0, fmt.Sprintf("drift=%v", drift))
-
-			// Fire parallel shots, but if no slots found, keep polling for up to
-			// 30 seconds AFTER drop time. Resy may drop a few seconds late.
-			slots = fireAvailabilityShots(client, cfg.Shots, findURL, findBody, "")
-			if len(slots) == 0 {
-				logf("No slots at T-0 — continuing to poll for 30s...")
-				deadline := cfg.DropTime.Add(30 * time.Second)
-				for time.Now().Before(deadline) {
-					data, status, err := doRequest(context.Background(), client, "POST", "https://api.resy.com/4/find", findBody, "application/json")
-					if err == nil && status == 200 {
-						lateSlots := parseSlots(data, "")
-						if len(lateSlots) > 0 {
-							logf("LATE DROP! Found %d slots at T+%v", len(lateSlots), time.Since(cfg.DropTime).Round(time.Millisecond))
-							tlog.record("late-drop", 0, len(lateSlots), fmt.Sprintf("T+%v", time.Since(cfg.DropTime).Round(time.Millisecond)))
-							slots = lateSlots
-							break
-						}
-					}
-					time.Sleep(150 * time.Millisecond)
-				}
-				skipFind = true // already have slots (or still empty)
-			} else {
-				skipFind = true
-			}
+		if !skipFind && len(slots) == 0 {
+			logf("Monitor exhausted: %d polls, no slots found", monCount)
+			tlog.record("monitor-exhausted", 0, monCount, fmt.Sprintf("%d polls", monCount))
 		}
 
 	} else {
@@ -416,7 +679,7 @@ func main() {
 	if !skipFind {
 		slots = fireAvailabilityShots(client, cfg.Shots, findURL, findBody, searchTime)
 	}
-	bookSlots(client, cfg, slots)
+	bookSlots(bookingClients, cfg, slots)
 }
 
 // ───────────────────────────── Booking Pipeline ─────────────────────────────
@@ -430,7 +693,7 @@ type bookResult struct {
 	err           error
 }
 
-func bookSlots(client *http.Client, cfg Config, slots []Slot) {
+func bookSlots(clients []*http.Client, cfg Config, slots []Slot) {
 	// Apply time range filter
 	if cfg.TimeRange != "" && len(slots) > 0 {
 		rangeStart, rangeEnd := parseTimeRange(cfg.TimeRange)
@@ -503,20 +766,23 @@ func bookSlots(client *http.Client, cfg Config, slots []Slot) {
 	defer cancel()
 	results := make(chan bookResult, n)
 
-	for _, s := range slots[:n] {
-		go func(slot Slot) {
-			bt, err := getBookToken(ctx, client, cfg, slot)
+	// Distribute slots across booking clients round-robin.
+	// Each goroutine gets a different residential IP for parallel booking.
+	for i, s := range slots[:n] {
+		c := clients[i%len(clients)]
+		go func(slot Slot, bookClient *http.Client) {
+			bt, err := getBookToken(ctx, bookClient, cfg, slot)
 			if err != nil {
 				results <- bookResult{err: fmt.Errorf("details for %s: %w", slot.TimeOnly, err), slot: slot}
 				return
 			}
-			rid, rt, err := bookReservation(ctx, client, cfg, bt)
+			rid, rt, err := bookReservation(ctx, bookClient, cfg, bt)
 			if err != nil {
 				results <- bookResult{err: fmt.Errorf("book %s: %w", slot.TimeOnly, err), slot: slot}
 				return
 			}
 			results <- bookResult{reservationID: rid, resyToken: rt, slot: slot}
-		}(s)
+		}(s, c)
 	}
 
 	var lastErr error
@@ -584,45 +850,55 @@ func bookSlots(client *http.Client, cfg Config, slots []Slot) {
 
 // ───────────────────────────── HTTP Client ─────────────────────────────
 
+// buildClient creates a single Chrome-fingerprinted client (no proxy).
+// Used by setup.go/handleSnipe for one-off operations.
 func buildClient() *http.Client {
-	// DNS pinning — resolve once, bypass DNS jitter in critical path
-	ips, err := net.LookupHost("api.resy.com")
-	if err == nil && len(ips) > 0 {
-		pinnedIP = ips[0]
-		logf("DNS pinned api.resy.com → %s", pinnedIP)
-	}
-
-	transport := &http.Transport{
-		DialContext:           pinnedDialer(pinnedIP),
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100, // default 2 is a TRAP — causes reconnects
-		MaxConnsPerHost:       100,
-		IdleConnTimeout:       120 * time.Second,
-		ExpectContinueTimeout: 0,     // skip 100-continue roundtrip on POSTs
-		DisableCompression:    false, // KEEP gzip — saves wire time on large responses
-		ForceAttemptHTTP2:     true,  // Resy API supports HTTP/2 (unlike OpenTable mobile)
-		TLSClientConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
-	}
-
-	// Cookie jar — accept and resend Imperva cookies.
-	// api.resy.com doesn't REQUIRE cookies (tested: 20/20 pass without),
-	// but sending them back looks more legitimate and avoids future enforcement.
-	jar, _ := cookiejar.New(nil)
-
-	return &http.Client{
-		Transport: transport,
-		Jar:       jar,
-		Timeout:   10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	return buildStickyClient("")
 }
 
 // ───────────────────────────── Request helpers ─────────────────────────────
 
 // Package-level timing log — set in main(), used throughout hot path.
 var tlog *TimingLog
+
+// doRequestNoAuth makes a GET request WITHOUT X-Resy-Auth-Token header.
+// Used for GET /3/details where the auth token is in the query string.
+// Having it in both query string AND header causes HTTP 409 Conflict.
+func doRequestNoAuth(ctx context.Context, client *http.Client, method, rawURL string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	setResyHeaders(req)
+	// Remove auth headers — token is in the query string for this endpoint
+	req.Header.Del("X-Resy-Auth-Token")
+	req.Header.Del("X-Resy-Universal-Auth")
+
+	t0 := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		if tlog != nil {
+			tlog.record(method+" "+rawURL[:min(len(rawURL), 60)], 0, 0, "error: "+err.Error())
+		}
+		return nil, 0, err
+	}
+	data, err := readCompressedBody(resp)
+	resp.Body.Close()
+	elapsed := time.Since(t0)
+
+	if tlog != nil {
+		endpoint := rawURL
+		if i := strings.Index(rawURL, "?"); i > 0 {
+			endpoint = rawURL[:i]
+		}
+		detail := fmt.Sprintf("rtt=%v", elapsed.Round(time.Microsecond))
+		if resp.StatusCode != 200 && resp.StatusCode != 201 {
+			detail += " body=" + truncate(data, 500)
+		}
+		tlog.record(method+" "+endpoint, resp.StatusCode, len(data), detail)
+	}
+	return data, resp.StatusCode, err
+}
 
 func doRequest(ctx context.Context, client *http.Client, method, rawURL string, body []byte, contentType string) ([]byte, int, error) {
 	var bodyReader io.Reader
@@ -653,6 +929,22 @@ func doRequest(ctx context.Context, client *http.Client, method, rawURL string, 
 	resp.Body.Close()
 	elapsed := time.Since(t0)
 
+	// Log Imperva/WAF response headers on non-200 for debugging bot detection
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		var hdrs []string
+		for _, key := range []string{"X-CDN", "X-Iinfo", "X-Cache", "Server", "Content-Type", "Cf-Ray", "Set-Cookie"} {
+			if v := resp.Header.Get(key); v != "" {
+				if key == "Set-Cookie" {
+					v = truncate([]byte(v), 80)
+				}
+				hdrs = append(hdrs, key+"="+v)
+			}
+		}
+		if len(hdrs) > 0 {
+			logResponse(fmt.Sprintf("headers-%d", resp.StatusCode), resp.StatusCode, []byte(strings.Join(hdrs, "\n")))
+		}
+	}
+
 	// Log timing + response details — time.Now() is ~20ns, negligible in hot path.
 	// On error responses, log the body so we can debug drop-day failures.
 	if tlog != nil {
@@ -672,29 +964,43 @@ func doRequest(ctx context.Context, client *http.Client, method, rawURL string, 
 }
 
 func readCompressedBody(resp *http.Response) ([]byte, error) {
-	var reader io.Reader = resp.Body
+	// tls-client (fhttp) handles decompression internally.
+	// Skip manual gzip — trying to gzip-decompress an already-decompressed
+	// body corrupts the stream and returns 0 bytes.
+	if resp.Uncompressed || resp.Header.Get("Content-Encoding") == "" {
+		return io.ReadAll(resp.Body)
+	}
+	// Only decompress if the body is actually still compressed (non-proxy path)
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gz, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return io.ReadAll(resp.Body)
 		}
 		defer gz.Close()
-		reader = gz
+		return io.ReadAll(gz)
 	}
-	return io.ReadAll(reader)
+	return io.ReadAll(resp.Body)
 }
 
 // ───────────────────────────── URL builders ─────────────────────────────
 
 // fetchVenueName gets the restaurant name from the config API.
 // Called once at startup — not in the hot path.
-func fetchVenueName(venueID int) string {
+// Uses the provided client (Chrome TLS + proxy) to avoid tainting the IP
+// with a bare Go TLS fingerprint.
+func fetchVenueName(venueID int, clients ...*http.Client) string {
 	u := fmt.Sprintf("https://api.resy.com/2/config?venue_id=%d", venueID)
-	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("Authorization", resyAPIKey)
-	req.Header.Set("Accept", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	setResyHeaders(req)
+	var c *http.Client
+	if len(clients) > 0 && clients[0] != nil {
+		c = clients[0]
+	} else {
+		c = &http.Client{Timeout: 5 * time.Second}
+	}
+	resp, err := c.Do(req)
 	if err != nil {
 		return ""
 	}
@@ -725,15 +1031,21 @@ func buildFindBody(venueID int, date string, partySize int) []byte {
 }
 
 // detailsURL for GET fallback
+// buildDetailsURL constructs the GET /3/details URL with auth token as a query
+// parameter. This is an undocumented/deprecated endpoint that BYPASSES reCAPTCHA.
+// The normal POST /3/details triggers captcha; this GET version does not.
+// Credit: korbinschulz/resybot-open discovered this bypass.
 func buildDetailsURL(venueID int, date string, partySize int, authToken, configToken string) string {
-	return fmt.Sprintf("https://api.resy.com/3/details?day=%s&party_size=%d&venue_id=%d&config_id=%s",
-		date, partySize, venueID, url.QueryEscape(configToken))
+	return fmt.Sprintf("https://api.resy.com/3/details?day=%s&party_size=%d&venue_id=%d&config_id=%s&x-resy-auth-token=%s",
+		date, partySize, venueID, url.QueryEscape(configToken), url.QueryEscape(authToken))
 }
 
-// detailsBody for POST (matches resy.com web app)
+// detailsBody for POST — matches Chrome's second /3/details call.
+// commit:1 is required to receive the book_token (commit:0 returns info only).
+// Chrome sends party_size as STRING, omits venue_id.
 func buildDetailsBody(venueID int, date string, partySize int, configToken string) []byte {
-	return []byte(fmt.Sprintf(`{"day":"%s","party_size":%d,"venue_id":%d,"config_id":"%s"}`,
-		date, partySize, venueID, configToken))
+	return []byte(fmt.Sprintf(`{"commit":1,"config_id":"%s","day":"%s","party_size":"%d"}`,
+		configToken, date, partySize))
 }
 
 // ───────────────────────────── Parallel find ─────────────────────────────
@@ -760,6 +1072,7 @@ func fireAvailabilityShots(client *http.Client, n int, findURL string, findBody 
 				logf("Shot %d: request error: %v", id, err)
 				return
 			}
+			logResponse(fmt.Sprintf("shot-%d", id), status, data)
 			if status != 200 {
 				logf("Shot %d: HTTP %d", id, status)
 				return
@@ -993,36 +1306,44 @@ func timeToMinutes(t string) int {
 
 // ───────────────────────────── Details + Book ─────────────────────────────
 
-// getBookToken calls GET /3/details to get the book_token for a slot.
+// getBookToken calls GET /3/details (captcha bypass) to get the book_token for a slot.
+// Falls back to POST /3/details if GET fails.
 func getBookToken(ctx context.Context, client *http.Client, cfg Config, slot Slot) (string, error) {
-	// Use POST with JSON body (matches resy.com web app), GET as fallback.
-	detailsBody := buildDetailsBody(cfg.VenueID, cfg.Date, cfg.PartySize, slot.ConfigToken)
-	data, status, err := doRequest(ctx, client, "POST", "https://api.resy.com/3/details", detailsBody, "application/json")
-	if err != nil || status == 500 || status == 405 {
-		// Fallback to GET
-		detailsURL := buildDetailsURL(cfg.VenueID, cfg.Date, cfg.PartySize, cfg.AuthToken, slot.ConfigToken)
-		data, status, err = doRequest(ctx, client, "GET", detailsURL, nil, "")
+	// Try GET first — bypasses reCAPTCHA (auth token in query string, not headers).
+	// This is the flow that successfully booked with payment_id=0.
+	// POST /3/details with commit:1 triggers payment requirements.
+	detailsURL := buildDetailsURL(cfg.VenueID, cfg.Date, cfg.PartySize, cfg.AuthToken, slot.ConfigToken)
+	logf("Details GET: %s %s", slot.TimeOnly, slot.TableType)
+	data, status, err := doRequestNoAuth(ctx, client, "GET", detailsURL)
+	if err != nil || status == 500 || status == 405 || status == 412 || status == 409 {
+		logf("Details GET failed (status=%d err=%v) — trying POST", status, err)
+		detailsBody := buildDetailsBody(cfg.VenueID, cfg.Date, cfg.PartySize, slot.ConfigToken)
+		data, status, err = doRequest(ctx, client, "POST", "https://api.resy.com/3/details", detailsBody, "application/json")
 	}
 	if err != nil {
 		return "", err
 	}
+	logResponse("details-response", status, data)
 	if status != 200 && status != 201 {
-		return "", fmt.Errorf("HTTP %d: %s", status, truncate(data, 200))
+		logf("Details failed (HTTP %d): %s", status, truncate(data, 500))
+		return "", fmt.Errorf("HTTP %d: %s", status, truncate(data, 500))
 	}
 
 	// Byte-scan: find "book_token" then extract "value" from the object after it
 	outerIdx := bytes.Index(data, bookTokenOuter)
 	if outerIdx < 0 {
+		logf("Details response has no book_token key. Body: %s", truncate(data, 1000))
 		return "", fmt.Errorf("no book_token in details response")
 	}
 
-	// Search for "value": after "book_token" — handles both compact and pretty JSON
 	region := data[outerIdx:]
 	token := extractJSONValue(region, bookTokenKey)
 	if token == "" {
+		logf("Details response has book_token but no value. Region: %s", truncate(region, 500))
 		return "", fmt.Errorf("no book_token value in details response")
 	}
 
+	logf("Got book_token (%d chars)", len(token))
 	return token, nil
 }
 
@@ -1033,29 +1354,33 @@ func getBookToken(ctx context.Context, client *http.Client, cfg Config, slot Slo
 var bookPayloadSuffix string
 
 func initBookPayload(paymentID int, captchaToken string) {
+	// Always send struct_payment_method — even with id:0.
+	// id:0 is the "no payment" bypass for no-deposit venues.
+	// Omitting it entirely causes HTTP 402 (Chrome's widget uses Stripe session instead).
 	bookPayloadSuffix = "&struct_payment_method=" + url.QueryEscape(fmt.Sprintf(`{"id":%d}`, paymentID)) +
-		"&source_id=resy.com-venue-details"
+		"&source_id=resy.com-venue-details" +
+		"&venue_marketing_opt_in=0"
 	if captchaToken != "" {
 		bookPayloadSuffix += "&captcha_token=" + url.QueryEscape(captchaToken)
 	}
+	logf("Book payload: payment_id=%d captcha=%v suffix_len=%d", paymentID, captchaToken != "", len(bookPayloadSuffix))
 }
 
 func bookReservation(ctx context.Context, client *http.Client, cfg Config, bookToken string) (string, string, error) {
-	// Pre-built payload — only book_token is dynamic. ~200ns vs ~800ns for url.Values.
 	body := []byte("book_token=" + url.QueryEscape(bookToken) + bookPayloadSuffix)
 
+	logf("Booking: POST /3/book (token=%d chars, payload=%d bytes)", len(bookToken), len(body))
 	data, status, err := doRequest(ctx, client, "POST", "https://api.resy.com/3/book", body, "application/x-www-form-urlencoded")
 	if err != nil {
 		return "", "", err
 	}
 
-	// NOTE: GET /3/book captcha bypass was patched (405 Method Not Allowed).
-	// Tested 2026-03-22: GET → 405, POST without captcha_token → 201.
-	// POST works without captcha on tested venues. If captcha is ever enforced,
-	// will need CAPSolver integration ($0.80/1K solves).
+	// Log the full book response for debugging
+	logResponse("book-response", status, data)
 
 	if status != 200 && status != 201 {
-		return "", "", fmt.Errorf("HTTP %d: %s", status, truncate(data, 300))
+		logf("Book failed (HTTP %d): %s", status, truncate(data, 500))
+		return "", "", fmt.Errorf("HTTP %d: %s", status, truncate(data, 500))
 	}
 
 	// Extract reservation_id (may be number or string)
@@ -1064,7 +1389,7 @@ func bookReservation(ctx context.Context, client *http.Client, cfg Config, bookT
 	if resIDIdx >= 0 {
 		after := data[resIDIdx+len(resIDKey):]
 		// Skip whitespace
-		for len(after) > 0 && (after[0] == ' ' || after[0] == '\t') {
+		for len(after) > 0 && (after[0] == ' ' || after[0] == '\t' || after[0] == '\n' || after[0] == '\r') {
 			after = after[1:]
 		}
 		if len(after) > 0 {
@@ -1084,6 +1409,12 @@ func bookReservation(ctx context.Context, client *http.Client, cfg Config, bookT
 
 	resyToken := extractJSONValue(data, resyTokenKey)
 
+	if resID == "" && (status == 200 || status == 201) && len(data) == 0 {
+		// Some proxy configurations return 201 with empty body.
+		// The booking likely succeeded — treat as success with unknown ID.
+		logf("Book returned HTTP %d with empty body — booking likely succeeded", status)
+		return "unknown-" + fmt.Sprintf("%d", time.Now().Unix()), "", nil
+	}
 	if resID == "" {
 		return "", "", fmt.Errorf("no reservation_id in book response: %s", truncate(data, 300))
 	}
@@ -1109,11 +1440,13 @@ func extractJSONValue(data []byte, key []byte) string {
 		return ""
 	}
 	start++ // skip opening quote
-	end := bytes.IndexByte(data[start:], '"')
-	if end < 0 {
-		return ""
+	// Find closing quote, handling escaped quotes
+	for i := start; i < len(data); i++ {
+		if data[i] == '"' && (i == start || data[i-1] != '\\') {
+			return string(data[start:i])
+		}
 	}
-	return string(data[start : start+end])
+	return ""
 }
 
 // extractJSONStringBytes finds `key` in data and returns the string value after it (up to closing `"`).
@@ -1199,6 +1532,37 @@ func loadConfig() Config {
 		OutputJSON:  os.Getenv("RESY_OUTPUT") == "json",
 		WebhookURL:   os.Getenv("RESY_WEBHOOK"),
 		CapSolverKey: os.Getenv("RESY_CAPSOLVER_KEY"),
+		BlindFire:    os.Getenv("RESY_BLIND_FIRE") == "true",
+	}
+
+	// Parse --blind-fire and --monitor-until from command line args
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--blind-fire":
+			cfg.BlindFire = true
+		case "--monitor-until":
+			if i+1 < len(os.Args) {
+				i++
+				d, err := time.ParseDuration(os.Args[i])
+				if err != nil {
+					fatal("Invalid --monitor-until duration %q (e.g. 5m, 1h, 30m): %v", os.Args[i], err)
+				}
+				cfg.MonitorUntil = d
+			} else {
+				fatal("--monitor-until requires a duration (e.g. 5m, 1h)")
+			}
+		}
+	}
+
+	// Also support env var for monitor-until
+	if cfg.MonitorUntil == 0 {
+		if mu := os.Getenv("RESY_MONITOR_UNTIL"); mu != "" {
+			d, err := time.ParseDuration(mu)
+			if err != nil {
+				fatal("Invalid RESY_MONITOR_UNTIL %q: %v", mu, err)
+			}
+			cfg.MonitorUntil = d
+		}
 	}
 
 	if dt := os.Getenv("RESY_DROP_TIME"); dt != "" {
@@ -1259,13 +1623,70 @@ func intEnv(key string, fallback int) int {
 
 // ───────────────────────────── Logging ─────────────────────────────
 
+// initRunLog creates a per-run log file at ~/.noresi/runs/YYYYMMDD_HHMMSS.log
+// and tees all logf/fatal output to both stderr and the file.
+func initRunLog() {
+	dir := filepath.Join(os.Getenv("HOME"), ".noresi", "runs")
+	os.MkdirAll(dir, 0700)
+	name := time.Now().Format("20060102_150405") + ".log"
+	f, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		logf("Warning: could not create run log: %v", err)
+		return
+	}
+	runLogFile = f
+	logWriter = io.MultiWriter(os.Stderr, f)
+	logf("Run log: %s", filepath.Join(dir, name))
+
+	// Response body log — captures raw API responses for debugging
+	respName := time.Now().Format("20060102_150405") + "_responses.log"
+	respPath := filepath.Join(dir, respName)
+	rf, err := os.OpenFile(respPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		logf("Warning: could not create response log: %v", err)
+		return
+	}
+	respLog = rf
+	logf("Response log: %s", respPath)
+}
+
+// logResponse writes a timestamped response entry to the response log file.
+// Called for every find/details/book request during the critical window.
+func logResponse(phase string, status int, data []byte) {
+	if respLog == nil {
+		return
+	}
+	ts := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
+	// Write header line
+	fmt.Fprintf(respLog, "\n=== %s | %s | HTTP %d | %dB ===\n", ts, phase, status, len(data))
+	// Write body (cap at 20KB to avoid filling disk on large responses)
+	if len(data) > 20480 {
+		respLog.Write(data[:20480])
+		fmt.Fprintf(respLog, "\n... [truncated, %d total bytes]\n", len(data))
+	} else {
+		respLog.Write(data)
+		respLog.Write([]byte("\n"))
+	}
+}
+
 func logf(format string, args ...any) {
-	ts := time.Now().Format("15:04:05.000")
-	fmt.Fprintf(os.Stderr, "[table42 "+ts+"] "+format+"\n", args...)
+	ts := time.Now().Format("2006-01-02 15:04:05.000")
+	fmt.Fprintf(logWriter, "[table42 "+ts+"] "+format+"\n", args...)
 }
 
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "[table42] FATAL: "+format+"\n", args...)
+	ts := time.Now().Format("2006-01-02 15:04:05.000")
+	fmt.Fprintf(logWriter, "[table42 "+ts+"] FATAL: "+format+"\n", args...)
+	// Flush timing log before exit — os.Exit skips deferred functions
+	if tlog != nil {
+		tlog.dump()
+	}
+	if runLogFile != nil {
+		runLogFile.Close()
+	}
+	if respLog != nil {
+		respLog.Close()
+	}
 	webhookWg.Wait() // ensure webhooks send before exit
 	os.Exit(1)
 }
@@ -1294,56 +1715,48 @@ func notifyWebhook(webhookURL, title, message string, success bool) {
 		defer webhookWg.Done()
 		var payload []byte
 
-		if strings.Contains(webhookURL, "discord.com") {
-			// Discord rich embed
-			color := 0xFF4444 // red for failure
-			icon := "\u274c"  // ❌
-			if success {
-				color = 0x00CC66 // green for success
-				icon = "\u2705"  // ✅
-			}
+		color := 0xFF4444 // red for failure
+		icon := "\u274c"  // ❌
+		if success {
+			color = 0x00CC66 // green for success
+			icon = "\u2705"  // ✅
+		}
 
-			// Build timing field from tlog if available
-			timingStr := ""
-			if tlog != nil {
-				for _, e := range tlog.snapshot() {
-					if e.Status > 0 {
-						timingStr += fmt.Sprintf("`[%v]` %s → **%d** (%dB)\n",
-							e.Elapsed.Round(time.Millisecond), e.Step, e.Status, e.Size)
-					} else if e.Detail != "" {
-						timingStr += fmt.Sprintf("`[%v]` %s — %s\n",
-							e.Elapsed.Round(time.Millisecond), e.Step, e.Detail)
-					}
+		// Build timing field from tlog if available
+		timingStr := ""
+		if tlog != nil {
+			for _, e := range tlog.snapshot() {
+				if e.Status > 0 {
+					timingStr += fmt.Sprintf("`[%v]` %s → **%d** (%dB)\n",
+						e.Elapsed.Round(time.Millisecond), e.Step, e.Status, e.Size)
+				} else if e.Detail != "" {
+					timingStr += fmt.Sprintf("`[%v]` %s — %s\n",
+						e.Elapsed.Round(time.Millisecond), e.Step, e.Detail)
 				}
 			}
+		}
 
-			fields := []map[string]any{}
-			if timingStr != "" {
-				fields = append(fields, map[string]any{
-					"name":   "Pipeline Timeline",
-					"value":  timingStr,
-					"inline": false,
-				})
-			}
-
-			payload, _ = json.Marshal(map[string]any{
-				"embeds": []map[string]any{{
-					"title":       icon + " " + title,
-					"description": message,
-					"color":       color,
-					"fields":      fields,
-					"timestamp":   time.Now().Format(time.RFC3339),
-					"footer": map[string]any{
-						"text": fmt.Sprintf("table42 • %s", pinnedIP),
-					},
-				}},
-			})
-		} else {
-			// Slack / generic webhook format
-			payload, _ = json.Marshal(map[string]string{
-				"text": fmt.Sprintf("*%s*\n%s", title, message),
+		fields := []map[string]any{}
+		if timingStr != "" {
+			fields = append(fields, map[string]any{
+				"name":   "Pipeline Timeline",
+				"value":  timingStr,
+				"inline": false,
 			})
 		}
+
+		payload, _ = json.Marshal(map[string]any{
+			"embeds": []map[string]any{{
+				"title":       icon + " " + title,
+				"description": message,
+				"color":       color,
+				"fields":      fields,
+				"timestamp":   time.Now().Format(time.RFC3339),
+				"footer": map[string]any{
+					"text": fmt.Sprintf("table42 • %s", ""),
+				},
+			}},
+		})
 
 		req, _ := http.NewRequest("POST", webhookURL, bytes.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
@@ -1374,7 +1787,7 @@ func sendTestWebhook(webhookURL string) {
 				{"name": "Range", "value": os.Getenv("RESY_TIME_RANGE"), "inline": true},
 				{"name": "Drop", "value": os.Getenv("RESY_DROP_TIME"), "inline": true},
 				{"name": "Shots", "value": fmt.Sprintf("%s find / %s book", os.Getenv("RESY_SHOTS"), os.Getenv("RESY_MAX_BOOK")), "inline": true},
-				{"name": "DNS", "value": fmt.Sprintf("`%s`", pinnedIP), "inline": true},
+				{"name": "DNS", "value": fmt.Sprintf("`%s`", ""), "inline": true},
 				{"name": "Table Type", "value": os.Getenv("RESY_TABLE_TYPE"), "inline": true},
 				{"name": "Party Size", "value": os.Getenv("RESY_PARTY_SIZE"), "inline": true},
 				{"name": "Account", "value": func() string {

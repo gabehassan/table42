@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,13 +49,6 @@ func loadProxies(path string) *ProxyPool {
 	return &ProxyPool{proxies: proxies}
 }
 
-func (p *ProxyPool) next() string {
-	if p == nil || len(p.proxies) == 0 {
-		return ""
-	}
-	i := p.index.Add(1) - 1
-	return p.proxies[i%int64(len(p.proxies))]
-}
 
 func (p *ProxyPool) random() string {
 	if p == nil || len(p.proxies) == 0 {
@@ -135,8 +127,8 @@ func monitorForSlots(client *http.Client, venueID int, date, targetTime string, 
 			backoff = min(backoff*2, maxBackoff)
 			logf("Monitor: rate limited (HTTP %d) — backing off to %s", resp.StatusCode, backoff)
 
-		case 401:
-			fatal("Monitor: auth token expired (HTTP 401). Re-run with fresh credentials.")
+		case 401, 419:
+			fatal("Monitor: auth token rejected (HTTP %d). Re-run with fresh credentials.", resp.StatusCode)
 
 		default:
 			logf("Monitor: unexpected HTTP %d — retrying", resp.StatusCode)
@@ -156,16 +148,28 @@ func monitorForSlots(client *http.Client, venueID int, date, targetTime string, 
 var baseHeaders http.Header
 
 func initBaseHeaders() {
+	// Chrome Client Hint headers — Imperva checks these for consistency
+	// with the TLS fingerprint. Missing them when JA3 says Chrome = detection.
+	hints := chromeClientHintHeaders()
+
 	baseHeaders = http.Header{
-		"Authorization":   {resyAPIKey},
-		"User-Agent":      {userAgent},
-		"Accept":          {"application/json, text/plain, */*"},
-		"Accept-Encoding": {"gzip, deflate, br"},
-		"Origin":          {"https://resy.com"},
-		"Referer":         {"https://resy.com/"},
-		"X-Origin":        {"https://resy.com"},
-		"Cache-Control":   {"no-cache"},
-		"Dnt":             {"1"},
+		"Authorization":      {resyAPIKey},
+		"User-Agent":         {userAgent},
+		"Accept":             {"application/json, text/plain, */*"},
+		"Accept-Encoding":    {"gzip, deflate, br, zstd"},
+		"Accept-Language":    {"en,en-US;q=0.9"},
+		"Origin":             {"https://widgets.resy.com"},
+		"Referer":            {"https://widgets.resy.com/"},
+		"X-Origin":           {"https://widgets.resy.com"},
+		"Cache-Control":      {"no-cache"},
+		"Dnt":                {"1"},
+		"Priority":           {"u=1, i"},
+		"Sec-CH-UA":          {hints["Sec-CH-UA"]},
+		"Sec-CH-UA-Mobile":   {hints["Sec-CH-UA-Mobile"]},
+		"Sec-CH-UA-Platform": {hints["Sec-CH-UA-Platform"]},
+		"Sec-Fetch-Dest":     {"empty"},
+		"Sec-Fetch-Mode":     {"cors"},
+		"Sec-Fetch-Site":     {"same-site"},
 	}
 	if authHeader != "" {
 		baseHeaders["X-Resy-Auth-Token"] = []string{authHeader}
@@ -182,9 +186,9 @@ func setResyHeaders(req *http.Request) {
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-		req.Header.Set("Origin", "https://resy.com")
-		req.Header.Set("Referer", "https://resy.com/")
-		req.Header.Set("X-Origin", "https://resy.com")
+		req.Header.Set("Origin", "https://widgets.resy.com")
+		req.Header.Set("Referer", "https://widgets.resy.com/")
+		req.Header.Set("X-Origin", "https://widgets.resy.com")
 		req.Header.Set("Cache-Control", "no-cache")
 		req.Header.Set("DNT", "1")
 		if authHeader != "" {
@@ -213,52 +217,77 @@ func safeJitter(d time.Duration) time.Duration {
 	return j
 }
 
-// warmConnections primes the TCP+TLS connection to api.resy.com.
-// With HTTP/2, all requests multiplex over ONE connection, so we only
-// need 1 warmup request. Uses /3/geoip (lightest endpoint, ~50 bytes)
-// instead of /4/find (87KB) to avoid wasting rate limit budget.
-// Then fires one real POST /4/find to prime that specific HTTP/2 stream.
+// warmConnections primes the connection to api.resy.com and collects
+// Imperva session cookies (visid_incap, nlbi, incap_ses).
+//
+// Step 1: GET /3/geoip — lightest endpoint, establishes TLS + collects cookies
+// Step 2: POST /4/find — primes the exact endpoint path
+//
+// The cookies are stored in the http.Client's cookie jar and sent back
+// on all subsequent requests. This gives Imperva an established session
+// baseline before the critical monitoring window begins.
+// No reese84/utmvc cookies are served on API endpoints (confirmed by testing).
 func warmConnections(client *http.Client, n int, findURL string, findBody []byte) {
-	logf("Warming connection...")
+	logf("Warming connection + collecting Imperva session cookies...")
 	start := time.Now()
 
-	// Step 1: lightest endpoint to establish TCP+TLS+H2
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Step 1: GET /3/geoip — collect Imperva cookies (visid_incap, nlbi, incap_ses)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.resy.com/3/geoip", nil)
 	setResyHeaders(req)
 	resp, err := client.Do(req)
 	if err == nil {
-		io.ReadAll(resp.Body)
+		// Log Imperva cookies from Set-Cookie headers
+		var cookies []string
+		// Try canonical key first, then lowercase (fhttp may use either)
+		for _, key := range []string{"Set-Cookie", "set-cookie"} {
+			for _, sc := range resp.Header.Values(key) {
+				if i := strings.IndexByte(sc, '='); i > 0 {
+					cookies = append(cookies, sc[:i])
+				}
+			}
+		}
+		if len(cookies) > 0 {
+			logf("Imperva cookies: %v", cookies)
+		} else {
+			logf("Warmup geoip: HTTP %d (no Set-Cookie headers found, %d header keys total)", resp.StatusCode, len(resp.Header))
+		}
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+	} else {
+		logf("Warmup geoip: %v", err)
 	}
 	cancel()
 
-	// Step 2: one real POST /4/find to prime the exact endpoint path
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-	req2, _ := http.NewRequestWithContext(ctx2, "POST", "https://api.resy.com/4/find", bytes.NewReader(findBody))
+	// Step 2: GET /2/user — prime the authenticated session (Chrome does this before booking).
+	// This tells the server "this user is active" and may establish payment bypass state.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	req2, _ := http.NewRequestWithContext(ctx2, "GET", "https://api.resy.com/2/user", nil)
 	setResyHeaders(req2)
-	req2.Header.Set("Content-Type", "application/json")
 	resp2, err := client.Do(req2)
 	if err == nil {
-		io.ReadAll(resp2.Body)
+		io.Copy(io.Discard, resp2.Body)
 		resp2.Body.Close()
+		logf("Warmup /2/user: HTTP %d", resp2.StatusCode)
+	} else {
+		logf("Warmup /2/user: %v", err)
 	}
 	cancel2()
+
+	// Step 3: POST /4/find — prime the exact endpoint path
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+	req3, _ := http.NewRequestWithContext(ctx3, "POST", "https://api.resy.com/4/find", bytes.NewReader(findBody))
+	setResyHeaders(req3)
+	req3.Header.Set("Content-Type", "application/json")
+	resp3, err := client.Do(req3)
+	if err == nil {
+		io.Copy(io.Discard, resp3.Body)
+		resp3.Body.Close()
+	} else {
+		logf("Warmup find: %v", err)
+	}
+	cancel3()
 
 	logf("Connection warmed (%v)", time.Since(start).Round(time.Millisecond))
 }
 
-// pinnedDialer creates a dialer that resolves DNS once and reuses the IP.
-func pinnedDialer(pinnedIP string) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout:   5 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if pinnedIP != "" {
-			_, port, _ := net.SplitHostPort(addr)
-			addr = net.JoinHostPort(pinnedIP, port)
-		}
-		return dialer.DialContext(ctx, network, addr)
-	}
-}

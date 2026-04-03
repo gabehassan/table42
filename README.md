@@ -1,264 +1,181 @@
 # table42
 
-Book restaurant reservations the instant they drop on Resy. A single Go binary that snipes competitive slots — like 4 Charles Prime Rib, Carbone, and Torrisi — in under 300ms, before other bots and humans can react.
+A high-performance Resy reservation sniper written in Go. Books competitive restaurant slots (4 Charles Prime Rib, Carbone, Torrisi) the instant they drop, before other bots and humans can react.
 
-> Looking for OpenTable? Check out [noresi](https://github.com/gabehassan/noresi) — same architecture, built for the OpenTable mobile API.
+Built to defeat [Imperva WAF](https://www.imperva.com/) bot detection through full Chrome browser impersonation at every layer: TLS fingerprint (JA3/JA4), HTTP/2 SETTINGS frame, header ordering, Client Hints, and Imperva session cookie management, all routed through benchmarked residential proxies.
 
-## Quick Start (Easy Mode)
+## Quick Start
 
-**1. Get your auth token** — go to [resy.com](https://resy.com), log in, open DevTools (`F12`) → Console, paste this:
+**1. Get your auth token** from [resy.com](https://resy.com). Log in, open DevTools (`F12`) → Console, paste:
 
 ```js
 copy(apiAuthToken);console.log(apiAuthToken)
 ```
 
-That copies your auth token to the clipboard. (Resy stores it as `window.apiAuthToken`.)
-
-**2. Build**
+**2. Build and configure**
 
 ```bash
 git clone git@github.com:gabehassan/table42.git && cd table42
 go build -o table42 .
-```
-
-**3. Set your token**
-
-```bash
 cp .env.example .env
-# Edit .env and paste your auth token as RESY_AUTH_TOKEN=...
+# Edit .env: paste your auth token, set venue and date
 ```
 
-**4. Book** — paste any Resy URL:
+**3. Book**
 
 ```bash
+# Paste any Resy URL
 ./table42 snipe "https://resy.com/cities/new-york-ny/venues/lartusi-ny?date=2026-04-15&seats=2"
-```
 
-Or use the interactive setup wizard:
-
-```bash
+# Or use the interactive wizard
 ./table42 setup
+
+# Or configure .env and run directly
+./table42
 ```
 
-Or search for a restaurant:
-
-```bash
-./table42 search "carbone"
-```
-
-## Power User Setup
-
-For competitive drops (4 Charles, Carbone, etc.) where milliseconds matter:
-
-### Configure `.env`
-
-```bash
-# Auth (paste token from browser, or use email+password)
-RESY_AUTH_TOKEN=eyJ0eXAi...
-
-# Target
-RESY_VENUE_ID=834                           # 4 Charles Prime Rib
-RESY_DATE=2026-04-12
-RESY_TIME=19:00                             # Preferred (slots sorted by proximity)
-RESY_TIME_RANGE=17:00-22:00                 # Accept anything in this window
-RESY_PARTY_SIZE=2
-RESY_TABLE_TYPE=Indoor Dining
-
-# Drop time — bot sleeps until this moment, then fires
-RESY_DROP_TIME=2026-03-23T09:00:00-04:00
-
-# Parallel attempts
-RESY_SHOTS=3                                # 3 parallel find requests (optimal)
-RESY_MAX_BOOK=5                             # Try 5 slots simultaneously
-
-# CAPTCHA (optional — pre-solves before drop)
-RESY_CAPSOLVER_KEY=CAP-...                  # capsolver.com, $0.001/solve
-
-# Notifications
-RESY_WEBHOOK=https://discord.com/api/webhooks/...
-
-RESY_OUTPUT=json
-```
-
-### Run
-
-```bash
-./table42                    # Run (mode determined by config)
-./table42 test               # Test webhooks
-./table42 cancel             # List bookings
-./table42 cancel all         # Cancel all bookings
-```
-
-### Deploy to VPS
-
-For minimum latency, run on a VPS in `us-east-1` (Ashburn, VA — same datacenter as Resy's API):
-
-```bash
-make build-linux
-./scripts/deploy.sh user@your-vps
-
-# On the VPS:
-ssh your-vps
-cd ~/table42 && nohup ./table42 > output.log 2>&1 &
-```
+The bot handles: Imperva cookies, Chrome fingerprinting, captcha bypass, and parallel booking.
 
 ## How It Works
 
-Three-stage pipeline: **Find** slots → get **Details** (book token) → **Book** the reservation.
+Resy's API is protected by Imperva's Advanced Bot Protection. Standard HTTP clients are detected and blocked during drops. table42 impersonates Chrome 146 end-to-end:
+
+| Detection Layer | What Imperva Checks | How table42 Bypasses It |
+|---|---|---|
+| **TLS** | JA3/JA4 fingerprint | Chrome 146 exact match via [tls-client](https://github.com/bogdanfinn/tls-client) |
+| **HTTP/2** | SETTINGS frame, pseudo-header order | Chrome values (`WINDOW_SIZE=6MB`, `m,a,s,p` ordering) |
+| **Headers** | Order, Client Hints, Sec-Fetch | Deterministic Chrome order, full `Sec-CH-UA` / `Sec-Fetch-*` |
+| **Sessions** | Imperva cookies | Collected at warmup, persisted across requests |
+| **IP** | Datacenter vs residential | Residential proxies with sticky sessions |
+| **reCAPTCHA** | Venue-level captcha | Bypassed via undocumented `GET /3/details` endpoint |
+
+### Booking Pipeline
 
 ```
-  POST /4/find ──→ POST /3/details ──→ POST /3/book
-     ~110ms            ~28ms              ~120ms
-
-                   ~265ms total
+POST /4/find ──→ GET /3/details ──→ POST /3/book
 ```
 
-### Drop-Time Timeline
+Monitors for slots, then fires the full pipeline instantly. No captcha delay. Multiple booking attempts through different proxy IPs in parallel, first success wins.
 
+<details>
+<summary>Proxies (optional, required on VPS)</summary>
+
+Not needed on home networks. Required on VPS for competitive venues (Imperva blocks datacenter IPs).
+
+Create `proxylist.txt` next to `.env`:
+
+```bash
+# Sticky sessions recommended (same IP for 30 min)
+state.decodo.com:15001:user-USERNAME-sessionduration-30:PASSWORD
+state.decodo.com:15002:user-USERNAME-sessionduration-30:PASSWORD
+# ... add 6-10 endpoints
+
+# Also supports URL format
+http://user:pass@host:port
 ```
-T-60s  Pre-solve reCAPTCHA via CAPSolver (if configured)
-T-30s  Warm HTTP/2 connection (TCP + TLS handshake)
-       Pre-build booking payload, disable garbage collector
-T-10s  Pre-poll every 150ms (catches early drops)
-T-0s   Spin-wait fires with 33ns precision
-       3 parallel find shots (broadcast pattern)
-       5 parallel booking attempts on best slots
-T+30s  Retry loop if no slots at T-0 (handles late drops)
+
+```bash
+./table42 test-proxy   # Test and benchmark all proxies
 ```
 
-### Three Modes
+At startup the bot benchmarks all proxies, assigns fastest to booking, next batch to monitoring, and drops failures. Falls back to direct if all proxies fail.
 
-| Mode | Use | Trigger |
-|------|-----|---------|
-| **Sniper** | Known drop time | Set `RESY_DROP_TIME` |
-| **Monitor** | Unknown drop / cancellations | Set `RESY_MONITOR=true` |
-| **Immediate** | Slots available now | Neither set |
+</details>
+
+<details>
+<summary>Drop-time mode</summary>
+
+```bash
+# .env
+RESY_VENUE_ID=834
+RESY_DATE=2026-04-22
+RESY_DROP_TIME=2026-04-02T09:00:00-04:00
+RESY_TIME=19:00
+RESY_TIME_RANGE=17:00-22:00
+RESY_PARTY_SIZE=2
+RESY_TABLE_TYPE=Indoor Dining
+```
+
+```bash
+./table42                       # Monitor until slots appear
+./table42 --monitor-until 15m   # Stop 15 min after drop
+./table42 --blind-fire          # Also fire at exact T-0
+```
+
+The bot sleeps until T-30s, warms all connections, then monitors target date ±1 day in parallel. When slots appear → book instantly → Discord webhook.
+
+</details>
 
 ## Performance
 
-Measured against the live Resy API from AWS us-east-1:
-
 | Metric | table42 | Python bots |
 |--------|---------|-------------|
-| Find + Details | **138ms** | ~1,400ms |
-| Full pipeline (find → book) | **265ms** | ~2,500ms |
-| JSON parse (99KB) | 32us | ~10ms |
-| Spin-wait precision | 33ns | ~1ms |
+| Full pipeline (find → book) | **~1s** (proxy) / **~200ms** (direct) | ~2,500ms |
+| JSON parse (99KB) | **32µs** | ~10ms |
+| Parallel booking | **3 simultaneous IPs** | 1 sequential |
 
-**~10x faster than the leading open-source alternatives.**
-
-### Why
-
-- DNS pinning — resolve once, skip DNS on every request
-- HTTP/2 multiplexing — single TCP connection for all parallel shots
-- Byte scanning — 19x faster than `json.Unmarshal`
-- Pre-built payloads and headers — zero allocation at fire time
-- GC suppression — no stop-the-world pauses during booking
-- Broadcast firing — all goroutines unblock simultaneously via `close(ready)`
-- Spin-wait — OS sleep until T-2ms, then busy-wait on a pinned thread
+**Why:** zero-alloc hot path, byte-scan JSON parser (19x faster than `json.Unmarshal`), broadcast-pattern goroutines, GC suppression, spin-wait timing (33ns precision).
 
 ## Known Drop Times
 
 | Restaurant | Drop Time (ET) | Days Out | Notes |
 |---|---|---|---|
-| 4 Charles Prime Rib | 9:00 AM | 20 | Verified/VIP priority system |
+| 4 Charles Prime Rib | 9:00 AM | 20 | $5/pp reservation fee |
 | Carbone | 10:00 AM | 30 | $50/pp deposit |
 | Torrisi | 10:00 AM | 30 | Same group as Carbone |
 | Tatiana | 12:00 PM | 27-28 | Also accepts phone reservations |
 
-## Configuration Reference
+<details>
+<summary>Commands</summary>
+
+```bash
+./table42                       # Run (mode from .env)
+./table42 snipe <resy-url>      # Book from URL
+./table42 setup                 # Interactive wizard
+./table42 search <name>         # Search venues
+./table42 test                  # Test Discord webhook
+./table42 test-proxy            # Benchmark proxies
+./table42 cancel                # List bookings
+./table42 cancel <id>           # Cancel a booking
+```
+
+</details>
 
 <details>
 <summary>All environment variables</summary>
 
-### Authentication
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RESY_EMAIL` | Yes* | — | Resy account email |
-| `RESY_PASSWORD` | Yes* | — | Resy account password |
-| `RESY_AUTH_TOKEN` | No | — | Skip login (valid ~45 days) |
-| `RESY_PAYMENT_ID` | No | auto | `0` works for no-deposit venues |
-| `RESY_ACCOUNT_NAME` | No | auto | Display name for webhooks |
-
-*Not required if `RESY_AUTH_TOKEN` is set.
-
-### Target
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RESY_VENUE_ID` | Yes | — | Numeric venue ID |
-| `RESY_DATE` | Yes | — | `YYYY-MM-DD` |
-| `RESY_TIME` | No | — | Preferred `HH:MM` (sorted by proximity) |
-| `RESY_TIME_RANGE` | No | — | Window, e.g. `17:00-22:00` |
-| `RESY_PARTY_SIZE` | No | `2` | Guests |
-| `RESY_TABLE_TYPE` | No | any | e.g. `Indoor Dining` |
-
-### Sniper
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RESY_DROP_TIME` | No | — | RFC3339: `2026-04-01T09:00:00-04:00` |
-| `RESY_SHOTS` | No | `3` | Parallel find shots |
-| `RESY_MAX_BOOK` | No | `5` | Parallel booking attempts |
-
-### Monitor
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RESY_MONITOR` | No | `false` | Enable polling mode |
-| `RESY_MONITOR_INTERVAL` | No | `30` | Poll interval (seconds) |
-| `RESY_PROXY_FILE` | No | — | Proxy list (one per line) |
-
-### CAPTCHA
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RESY_CAPSOLVER_KEY` | No | — | capsolver.com API key |
-| `RESY_CAPTCHA_LEAD` | No | `60` | Seconds before drop to pre-solve |
-
-### Output
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RESY_WEBHOOK` | No | — | Discord or Slack webhook URL |
-| `RESY_OUTPUT` | No | — | `json` for machine-readable stdout |
-| `RESY_LOG_FILE` | No | `~/.noresi/table42.log` | Timing log path |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RESY_AUTH_TOKEN` | - | Auth token from resy.com DevTools |
+| `RESY_EMAIL` / `RESY_PASSWORD` | - | Alternative to token |
+| `RESY_VENUE_ID` | - | Numeric venue ID (required) |
+| `RESY_DATE` | - | Target date `YYYY-MM-DD` (required) |
+| `RESY_TIME` | - | Preferred time `HH:MM` |
+| `RESY_TIME_RANGE` | - | Acceptable window, e.g. `17:00-22:00` |
+| `RESY_PARTY_SIZE` | `2` | Number of guests |
+| `RESY_TABLE_TYPE` | any | e.g. `Indoor Dining` |
+| `RESY_DROP_TIME` | - | RFC3339 drop time |
+| `RESY_SHOTS` | `3` | Parallel find requests |
+| `RESY_MAX_BOOK` | `5` | Parallel booking attempts |
+| `RESY_BLIND_FIRE` | `false` | Fire at exact T-0 |
+| `RESY_MONITOR_UNTIL` | indefinite | e.g. `5m`, `1h` |
+| `RESY_WEBHOOK` | - | Discord webhook URL |
+| `RESY_PROXY_FILE` | `proxylist.txt` | Proxy list path |
+| `RESY_PAYMENT_ID` | auto | `0` for no-deposit venues |
+| `RESY_OUTPUT` | - | `json` for machine output |
 
 </details>
 
-## Architecture
-
-```
-main.go        Core: config, HTTP client, find/details/book pipeline, timing
-auth.go        Email+password login, token caching, payment method fetch
-bookings.go    Booking persistence, cancel command
-captcha.go     CAPSolver integration, pre-solve before drop
-proxy.go       Proxy pool, monitor client, connection warming, headers
-setup.go       Setup wizard, venue search, snipe-by-URL mode
-bench_live.go  Live benchmark suite (build-ignored)
-```
-
 ## Acknowledgments
 
-This project was informed by research from several open-source Resy projects:
-
-- [korbinschulz/resybot-open](https://github.com/korbinschulz/resybot-open) — API endpoint documentation, booking flow reference
-- [Alkaar/resy-booking-bot](https://github.com/Alkaar/resy-booking-bot) — The most popular Resy bot (Scala), community discussions on rate limits and detection
-- [daylamtayari/cierge](https://github.com/daylamtayari/cierge) — Most complete Go Resy API implementation, dynamic API key extraction
-- [21Bruce/resolved-bot](https://github.com/21Bruce/resolved-bot) — Go-based Resy bot with venue search integration
-- [bthuilot/book-it](https://github.com/bthuilot/book-it) — Go + PostgreSQL Resy booking system
+- [korbinschulz/resybot-open](https://github.com/korbinschulz/resybot-open) for discovering the `GET /3/details` reCAPTCHA bypass
+- [bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client) for Chrome TLS + HTTP/2 fingerprint impersonation
 
 ## Disclaimer
 
-This software is provided for **personal, educational use only**.
+This software is for **personal use only**: booking reservations for yourself, on your own Resy account. Not for resale, not for commercial use. Reselling reservations may violate the [New York Restaurant Reservation Anti-Piracy Act](https://www.nysenate.gov/legislation/bills/2023/S9365) (fines up to $1,000/violation).
 
-- **Personal use only.** Designed to help individuals book reservations for themselves. Not for commercial resale.
-- **No resale.** Do not use this to acquire reservations for selling on any marketplace. Reselling may violate the New York Restaurant Reservation Anti-Piracy Act (2024), with fines up to $1,000 per violation.
-- **Compliance.** You are responsible for complying with Resy's terms of service and each restaurant's reservation and cancellation policies.
-- **Payment and charges.** Some restaurants require a deposit or credit card hold when booking. By using this software, you acknowledge that you may incur charges including deposits, cancellation fees, or no-show penalties as determined by the restaurant. The author is not responsible for any financial charges resulting from reservations made with this tool. Review the restaurant's policies before booking.
-- **No warranty.** Provided "as is" without warranty. The author is not responsible for account suspensions, legal action, financial charges, or missed reservations.
-- **Don't be a jerk.** If you book, show up. No-shows hurt restaurants and other diners. Cancel if plans change.
+By using this software you accept all responsibility for compliance with Resy's Terms of Service, restaurant policies, and applicable law. The author provides no warranty and accepts no liability for account actions, financial charges, or missed reservations. **[Full legal terms →](LEGAL.md)**
 
 ## License
 

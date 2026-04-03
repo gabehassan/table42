@@ -473,7 +473,7 @@ func handleSnipe(resyURL string) {
 
 	logf("Firing immediately...")
 	slots := fireAvailabilityShots(client, cfg.Shots, findURL, findBody, "")
-	bookSlots(client, cfg, slots)
+	bookSlots([]*http.Client{client}, cfg, slots)
 }
 
 // handleSearch searches for venues and prints results.

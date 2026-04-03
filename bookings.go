@@ -145,10 +145,8 @@ func cancelReservation(resyToken string) error {
 	req.Header.Set("Origin", "https://resy.com")
 	req.Header.Set("Referer", "https://resy.com/")
 	req.Header.Set("X-Origin", "https://resy.com")
-	if token != "" {
-		req.Header.Set("X-Resy-Auth-Token", token)
-		req.Header.Set("X-Resy-Universal-Auth", token)
-	}
+	req.Header.Set("X-Resy-Auth-Token", token)
+	req.Header.Set("X-Resy-Universal-Auth", token)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)

@@ -120,6 +120,34 @@ func loginResy(email, password string) (string, int, string, string, error) {
 	return token, paymentID, firstName, lastName, nil
 }
 
+// validateAuthToken checks if the auth token is still accepted by Resy.
+// Called at startup and at T-60s wake to avoid burning an entire run on a dead token.
+// Uses the provided client (Chrome TLS + proxy) to avoid bare Go TLS fingerprint.
+func validateAuthToken(token string, clients ...*http.Client) error {
+	req, _ := http.NewRequest("GET", "https://api.resy.com/2/user", nil)
+	setResyHeaders(req)
+
+	var c *http.Client
+	if len(clients) > 0 && clients[0] != nil {
+		c = clients[0]
+	} else {
+		c = &http.Client{Timeout: 10 * time.Second}
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return fmt.Errorf("validation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	io.ReadAll(resp.Body)
+
+	if resp.StatusCode == 419 || resp.StatusCode == 401 {
+		return fmt.Errorf("HTTP %d — token revoked or expired", resp.StatusCode)
+	}
+	// Accept any non-auth-error response. /2/user returns 409 for some accounts
+	// (profile conflict) but the token is still valid for booking.
+	return nil
+}
+
 // getPaymentMethodID fetches the user's payment methods from the account profile.
 // Tries GET /2/user which returns payment_method_id and payment_methods[].
 // Required for venues with deposits — payment_id=0 works for no-deposit venues.
